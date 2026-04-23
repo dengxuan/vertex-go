@@ -66,6 +66,11 @@ type Channel struct {
 	handlers    map[string]requestHandlerFn
 	closed      bool
 
+	// statsMu guards the stats maps. Separate from mu so Stats() callers
+	// don't contend with the hot dispatch path.
+	statsMu       sync.RWMutex
+	eventsDropped map[string]uint64
+
 	// lifetimeCtx is cancelled by Close. Every dispatched event / request
 	// handler and every channel-initiated Send derives its ctx from here,
 	// so shutdown is cooperative without spawning a watcher goroutine per
@@ -83,10 +88,30 @@ type Channel struct {
 // and the receive loop never blocks.
 type subscription struct {
 	id    uint64
+	topic string
 	fn    subscriberFn
 	inbox chan []byte
+	// dropped is a monotonic counter of events rejected because inbox was full.
+	// Exposed per-topic via Channel.Stats().
+	dropped atomic.Uint64
 	// cancelled is closed by the unsubscribe func to tell the worker to exit.
 	cancelled chan struct{}
+}
+
+// ChannelStats is a snapshot of observable runtime state, safe for monitoring
+// loops. Vertex does not reset counters — all fields are monotonic since
+// channel construction. To compute a rate, sample twice and diff.
+type ChannelStats struct {
+	// EventsDropped is the total count of events NOT delivered because a
+	// subscriber's inbox was full, aggregated per topic across all
+	// subscriptions for that topic.
+	//
+	// A non-zero (and growing) value means at least one subscriber for that
+	// topic cannot keep up with the event rate. Remedies: bigger inbox
+	// (WithSubscriberInboxSize), a faster handler, or — if the loss is
+	// not tolerable — switch that flow from Publish to Invoke so the sender
+	// learns of failure.
+	EventsDropped map[string]uint64
 }
 
 // subscriberFn is the internal form of an event subscriber. The outer generic
@@ -124,12 +149,29 @@ func NewChannel(name string, t transport.Transport, opts ...Option) *Channel {
 		pending:        make(map[string]*pendingRequest),
 		subscribers:    make(map[string][]*subscription),
 		handlers:       make(map[string]requestHandlerFn),
+		eventsDropped:  make(map[string]uint64),
 		lifetimeCtx:    ctx,
 		lifetimeCancel: cancel,
 	}
+	co.logger.Info("vertex messaging channel started",
+		"channel", name,
+		"transport", t.Name())
 	go ch.receiveLoop()
 	go ch.connectionLoop()
 	return ch
+}
+
+// Stats returns a snapshot of monitoring counters. Safe to call from any
+// goroutine; cheap (O(topics) map copy). Call at a steady cadence and diff
+// to get rates.
+func (c *Channel) Stats() ChannelStats {
+	c.statsMu.RLock()
+	dropped := make(map[string]uint64, len(c.eventsDropped))
+	for k, v := range c.eventsDropped {
+		dropped[k] = v
+	}
+	c.statsMu.RUnlock()
+	return ChannelStats{EventsDropped: dropped}
 }
 
 // Publish sends a fire-and-forget event to the default peer. target may be empty
@@ -335,8 +377,19 @@ func (c *Channel) dispatchEvent(env Envelope) {
 		select {
 		case sub.inbox <- env.Payload:
 		default:
-			// Dropped: this subscriber's inbox is full. The app may tune
-			// WithSubscriberInboxSize if this happens persistently.
+			// Dropped: this subscriber's inbox is full. Record it so ops
+			// monitoring Channel.Stats() can notice, and log at Warn so
+			// live diagnostics surface slow handlers in realtime.
+			sub.dropped.Add(1)
+			c.statsMu.Lock()
+			c.eventsDropped[env.Topic]++
+			c.statsMu.Unlock()
+			c.opts.logger.Warn("vertex messaging: event dropped (subscriber inbox full)",
+				"channel", c.name,
+				"topic", env.Topic,
+				"subscription_id", sub.id,
+				"inbox_cap", cap(sub.inbox),
+				"subscription_dropped_total", sub.dropped.Load())
 		}
 	}
 }
@@ -377,6 +430,9 @@ func (c *Channel) dispatchRequest(env Envelope, from string) {
 func (c *Channel) invokeHandlerSafely(ctx context.Context, h requestHandlerFn, payload []byte) (resp []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			c.opts.logger.Error("vertex messaging: RPC handler panicked",
+				"channel", c.name,
+				"panic", fmt.Sprintf("%v", r))
 			err = fmt.Errorf("vertex messaging: handler panicked: %v", r)
 			resp = nil
 		}
@@ -395,7 +451,15 @@ func (c *Channel) sendErrorResponse(topic, requestID, target, message string) {
 	// this. Timeout is WithErrorResponseTimeout (default 5s).
 	ctx, cancel := context.WithTimeout(context.Background(), c.opts.errorResponseTimeout)
 	defer cancel()
-	_ = c.transport.Send(ctx, target, resp.Encode())
+	if err := c.transport.Send(ctx, target, resp.Encode()); err != nil {
+		// Invariant #2: a failed error-reply is still not a disconnect.
+		// Log so ops sees RPC-level problems (handler path may be pathological).
+		c.opts.logger.Warn("vertex messaging: error response Send failed (dropped)",
+			"channel", c.name,
+			"topic", topic,
+			"request_id", requestID,
+			"err", err.Error())
+	}
 }
 
 // registerSubscriber is the internal registration used by the generic Subscribe.
@@ -404,6 +468,7 @@ func (c *Channel) sendErrorResponse(topic, requestID, target, message string) {
 func (c *Channel) registerSubscriber(topic string, fn subscriberFn) func() {
 	sub := &subscription{
 		id:        c.nextSubID.Add(1),
+		topic:     topic,
 		fn:        fn,
 		inbox:     make(chan []byte, c.opts.subscriberInboxSize),
 		cancelled: make(chan struct{}),

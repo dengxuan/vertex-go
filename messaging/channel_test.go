@@ -125,6 +125,56 @@ func TestInvoke_HandlerError_SurfacesAsRemoteError(t *testing.T) {
 	}
 }
 
+func TestStats_TracksSubscriberInboxDrops(t *testing.T) {
+	// Force a tiny inbox so we can saturate it deterministically.
+	a, b := inMemTransportPair()
+	ca := NewChannel("alice", a)
+	defer ca.Close()
+	cb := NewChannel("bob", b, WithSubscriberInboxSize(1))
+	defer cb.Close()
+
+	// Slow subscriber: blocks inside the handler so its inbox fills fast.
+	unblock := make(chan struct{})
+	cancel, err := Subscribe[*wrapperspb.StringValue](cb, func(ctx context.Context, v *wrapperspb.StringValue) error {
+		<-unblock // handler never returns until test releases it
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer cancel()
+	defer close(unblock) // let the worker drain on teardown
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelCtx()
+
+	// Publish enough events to overflow the 1-slot inbox. The first one gets
+	// pulled into the worker (blocked in handler). The next fills the inbox.
+	// Events 3+ are dropped.
+	const N = 10
+	for i := 0; i < N; i++ {
+		if err := ca.Publish(ctx, "", &wrapperspb.StringValue{Value: "x"}); err != nil {
+			t.Fatalf("Publish %d: %v", i, err)
+		}
+	}
+
+	// Give the drop path a moment to observe.
+	deadline := time.Now().Add(2 * time.Second)
+	var got uint64
+	topic := string((&wrapperspb.StringValue{}).ProtoReflect().Descriptor().FullName())
+	for time.Now().Before(deadline) {
+		got = cb.Stats().EventsDropped[topic]
+		if got > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got == 0 {
+		t.Fatalf("expected at least some drops, got 0; stats=%+v", cb.Stats())
+	}
+	t.Logf("dropped %d/%d events (expected at least 1)", got, N)
+}
+
 func TestInvoke_NoHandler_ReturnsRemoteError(t *testing.T) {
 	a, b := inMemTransportPair()
 	ca := NewChannel("alice", a)

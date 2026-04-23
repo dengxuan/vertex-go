@@ -3,7 +3,11 @@
 
 package messaging
 
-import "time"
+import (
+	"context"
+	"log/slog"
+	"time"
+)
 
 // Option configures a Channel at construction time. Variadic functional-options
 // pattern keeps NewChannel backwards compatible while leaving room to tune
@@ -14,13 +18,18 @@ type channelOptions struct {
 	invokeDefaultTimeout time.Duration
 	errorResponseTimeout time.Duration
 	subscriberInboxSize  int
+	logger               *slog.Logger
 }
 
 func defaultChannelOptions() channelOptions {
 	return channelOptions{
 		invokeDefaultTimeout: 30 * time.Second,
 		errorResponseTimeout: 5 * time.Second,
-		subscriberInboxSize:  32,
+		// 256 is a reasonable per-subscription queue depth for production
+		// (the original MVP default of 32 was too tight under bursty load).
+		// Events still drop on overflow — see WithSubscriberInboxSize docs.
+		subscriberInboxSize: 256,
+		logger:              discardLogger(),
 	}
 }
 
@@ -44,8 +53,8 @@ func WithErrorResponseTimeout(d time.Duration) Option {
 // events are DROPPED for that subscriber (not blocked) so one slow handler
 // cannot stall the receive loop or other subscribers.
 //
-// Default: 32. Increase for bursty workloads; decrease for memory-tight
-// deployments with low event rates.
+// Default: 256. Increase for bursty workloads; decrease for memory-tight
+// deployments with low event rates. Monitor drops via [Channel.Stats].
 func WithSubscriberInboxSize(n int) Option {
 	return func(o *channelOptions) {
 		if n > 0 {
@@ -53,3 +62,35 @@ func WithSubscriberInboxSize(n int) Option {
 		}
 	}
 }
+
+// WithLogger wires a structured logger for the channel. Vertex logs at Warn
+// level on back-pressure drops (subscriber inbox full), handler panics
+// (recovered), and best-effort Send failures from internal paths (e.g. error
+// responses). At Info level on channel start. No high-frequency per-message
+// logging — your log pipeline stays quiet under normal load.
+//
+// If not set, Vertex uses a discard handler (zero output).
+//
+// Bridge example for zerolog / zap: wrap the target logger in a custom
+// slog.Handler. Most production Go logging libraries provide slog bridges.
+func WithLogger(l *slog.Logger) Option {
+	return func(o *channelOptions) {
+		if l != nil {
+			o.logger = l
+		}
+	}
+}
+
+// discardLogger returns a logger that produces no output. Used as default when
+// the user does not pass WithLogger. Equivalent to slog.DiscardHandler
+// (stdlib in Go 1.24+) but defined locally for broader Go version support.
+func discardLogger() *slog.Logger {
+	return slog.New(discardHandler{})
+}
+
+type discardHandler struct{}
+
+func (discardHandler) Enabled(context.Context, slog.Level) bool   { return false }
+func (discardHandler) Handle(context.Context, slog.Record) error  { return nil }
+func (h discardHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h discardHandler) WithGroup(string) slog.Handler            { return h }
