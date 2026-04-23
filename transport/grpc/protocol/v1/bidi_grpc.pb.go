@@ -12,7 +12,10 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.0
 // - protoc             v6.33.3
-// source: vertex/v1/transport/grpc/v1/bidi.proto
+// source: vertex/transport/grpc/v1/bidi.proto
+
+// Proto package includes the version; the directory path already lives under
+// /transport/grpc/v1/, so we don't duplicate the version here either.
 
 package protocolv1
 
@@ -29,7 +32,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Bidi_Connect_FullMethodName = "/vertex.v1.transport.grpc.v1.Bidi/Connect"
+	Bidi_Connect_FullMethodName = "/vertex.transport.grpc.v1.Bidi/Connect"
 )
 
 // BidiClient is the client API for Bidi service.
@@ -114,7 +117,7 @@ type Bidi_ConnectServer = grpc.BidiStreamingServer[TransportFrame, TransportFram
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var Bidi_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "vertex.v1.transport.grpc.v1.Bidi",
+	ServiceName: "vertex.transport.grpc.v1.Bidi",
 	HandlerType: (*BidiServer)(nil),
 	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
@@ -125,5 +128,5 @@ var Bidi_ServiceDesc = grpc.ServiceDesc{
 			ClientStreams: true,
 		},
 	},
-	Metadata: "vertex/v1/transport/grpc/v1/bidi.proto",
+	Metadata: "vertex/transport/grpc/v1/bidi.proto",
 }

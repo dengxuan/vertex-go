@@ -1,0 +1,7 @@
+# Keep vendored protos, sync scripts, and protoc-generated Go files LF,
+# otherwise Windows CRLF auto-conversion will cause the CI drift check
+# to false-positive.
+*.proto text eol=lf
+*.pb.go text eol=lf
+scripts/sync-protos.sh text eol=lf
+scripts/.spec-ref text eol=lf

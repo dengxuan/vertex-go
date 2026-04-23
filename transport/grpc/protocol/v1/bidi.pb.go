@@ -12,7 +12,10 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v6.33.3
-// source: vertex/v1/transport/grpc/v1/bidi.proto
+// source: vertex/transport/grpc/v1/bidi.proto
+
+// Proto package includes the version; the directory path already lives under
+// /transport/grpc/v1/, so we don't duplicate the version here either.
 
 package protocolv1
 
@@ -45,7 +48,7 @@ type TransportFrame struct {
 
 func (x *TransportFrame) Reset() {
 	*x = TransportFrame{}
-	mi := &file_vertex_v1_transport_grpc_v1_bidi_proto_msgTypes[0]
+	mi := &file_vertex_transport_grpc_v1_bidi_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -57,7 +60,7 @@ func (x *TransportFrame) String() string {
 func (*TransportFrame) ProtoMessage() {}
 
 func (x *TransportFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_vertex_v1_transport_grpc_v1_bidi_proto_msgTypes[0]
+	mi := &file_vertex_transport_grpc_v1_bidi_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -70,7 +73,7 @@ func (x *TransportFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransportFrame.ProtoReflect.Descriptor instead.
 func (*TransportFrame) Descriptor() ([]byte, []int) {
-	return file_vertex_v1_transport_grpc_v1_bidi_proto_rawDescGZIP(), []int{0}
+	return file_vertex_transport_grpc_v1_bidi_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *TransportFrame) GetPayload() []byte {
@@ -87,36 +90,36 @@ func (x *TransportFrame) GetEndOfMessage() bool {
 	return false
 }
 
-var File_vertex_v1_transport_grpc_v1_bidi_proto protoreflect.FileDescriptor
+var File_vertex_transport_grpc_v1_bidi_proto protoreflect.FileDescriptor
 
-const file_vertex_v1_transport_grpc_v1_bidi_proto_rawDesc = "" +
+const file_vertex_transport_grpc_v1_bidi_proto_rawDesc = "" +
 	"\n" +
-	"&vertex/v1/transport/grpc/v1/bidi.proto\x12\x1bvertex.v1.transport.grpc.v1\"P\n" +
+	"#vertex/transport/grpc/v1/bidi.proto\x12\x18vertex.transport.grpc.v1\"P\n" +
 	"\x0eTransportFrame\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\x12$\n" +
-	"\x0eend_of_message\x18\x02 \x01(\bR\fendOfMessage2o\n" +
-	"\x04Bidi\x12g\n" +
-	"\aConnect\x12+.vertex.v1.transport.grpc.v1.TransportFrame\x1a+.vertex.v1.transport.grpc.v1.TransportFrame(\x010\x01BiZCgithub.com/dengxuan/vertex-go/transport/grpc/protocol/v1;protocolv1\xaa\x02!Vertex.Transport.Grpc.Protocol.V1b\x06proto3"
+	"\x0eend_of_message\x18\x02 \x01(\bR\fendOfMessage2i\n" +
+	"\x04Bidi\x12a\n" +
+	"\aConnect\x12(.vertex.transport.grpc.v1.TransportFrame\x1a(.vertex.transport.grpc.v1.TransportFrame(\x010\x01BiZCgithub.com/dengxuan/vertex-go/transport/grpc/protocol/v1;protocolv1\xaa\x02!Vertex.Transport.Grpc.Protocol.V1b\x06proto3"
 
 var (
-	file_vertex_v1_transport_grpc_v1_bidi_proto_rawDescOnce sync.Once
-	file_vertex_v1_transport_grpc_v1_bidi_proto_rawDescData []byte
+	file_vertex_transport_grpc_v1_bidi_proto_rawDescOnce sync.Once
+	file_vertex_transport_grpc_v1_bidi_proto_rawDescData []byte
 )
 
-func file_vertex_v1_transport_grpc_v1_bidi_proto_rawDescGZIP() []byte {
-	file_vertex_v1_transport_grpc_v1_bidi_proto_rawDescOnce.Do(func() {
-		file_vertex_v1_transport_grpc_v1_bidi_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_vertex_v1_transport_grpc_v1_bidi_proto_rawDesc), len(file_vertex_v1_transport_grpc_v1_bidi_proto_rawDesc)))
+func file_vertex_transport_grpc_v1_bidi_proto_rawDescGZIP() []byte {
+	file_vertex_transport_grpc_v1_bidi_proto_rawDescOnce.Do(func() {
+		file_vertex_transport_grpc_v1_bidi_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_vertex_transport_grpc_v1_bidi_proto_rawDesc), len(file_vertex_transport_grpc_v1_bidi_proto_rawDesc)))
 	})
-	return file_vertex_v1_transport_grpc_v1_bidi_proto_rawDescData
+	return file_vertex_transport_grpc_v1_bidi_proto_rawDescData
 }
 
-var file_vertex_v1_transport_grpc_v1_bidi_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
-var file_vertex_v1_transport_grpc_v1_bidi_proto_goTypes = []any{
-	(*TransportFrame)(nil), // 0: vertex.v1.transport.grpc.v1.TransportFrame
+var file_vertex_transport_grpc_v1_bidi_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_vertex_transport_grpc_v1_bidi_proto_goTypes = []any{
+	(*TransportFrame)(nil), // 0: vertex.transport.grpc.v1.TransportFrame
 }
-var file_vertex_v1_transport_grpc_v1_bidi_proto_depIdxs = []int32{
-	0, // 0: vertex.v1.transport.grpc.v1.Bidi.Connect:input_type -> vertex.v1.transport.grpc.v1.TransportFrame
-	0, // 1: vertex.v1.transport.grpc.v1.Bidi.Connect:output_type -> vertex.v1.transport.grpc.v1.TransportFrame
+var file_vertex_transport_grpc_v1_bidi_proto_depIdxs = []int32{
+	0, // 0: vertex.transport.grpc.v1.Bidi.Connect:input_type -> vertex.transport.grpc.v1.TransportFrame
+	0, // 1: vertex.transport.grpc.v1.Bidi.Connect:output_type -> vertex.transport.grpc.v1.TransportFrame
 	1, // [1:2] is the sub-list for method output_type
 	0, // [0:1] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
@@ -124,26 +127,26 @@ var file_vertex_v1_transport_grpc_v1_bidi_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_vertex_v1_transport_grpc_v1_bidi_proto_init() }
-func file_vertex_v1_transport_grpc_v1_bidi_proto_init() {
-	if File_vertex_v1_transport_grpc_v1_bidi_proto != nil {
+func init() { file_vertex_transport_grpc_v1_bidi_proto_init() }
+func file_vertex_transport_grpc_v1_bidi_proto_init() {
+	if File_vertex_transport_grpc_v1_bidi_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vertex_v1_transport_grpc_v1_bidi_proto_rawDesc), len(file_vertex_v1_transport_grpc_v1_bidi_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_vertex_transport_grpc_v1_bidi_proto_rawDesc), len(file_vertex_transport_grpc_v1_bidi_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_vertex_v1_transport_grpc_v1_bidi_proto_goTypes,
-		DependencyIndexes: file_vertex_v1_transport_grpc_v1_bidi_proto_depIdxs,
-		MessageInfos:      file_vertex_v1_transport_grpc_v1_bidi_proto_msgTypes,
+		GoTypes:           file_vertex_transport_grpc_v1_bidi_proto_goTypes,
+		DependencyIndexes: file_vertex_transport_grpc_v1_bidi_proto_depIdxs,
+		MessageInfos:      file_vertex_transport_grpc_v1_bidi_proto_msgTypes,
 	}.Build()
-	File_vertex_v1_transport_grpc_v1_bidi_proto = out.File
-	file_vertex_v1_transport_grpc_v1_bidi_proto_goTypes = nil
-	file_vertex_v1_transport_grpc_v1_bidi_proto_depIdxs = nil
+	File_vertex_transport_grpc_v1_bidi_proto = out.File
+	file_vertex_transport_grpc_v1_bidi_proto_goTypes = nil
+	file_vertex_transport_grpc_v1_bidi_proto_depIdxs = nil
 }

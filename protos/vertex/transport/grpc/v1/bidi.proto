@@ -10,7 +10,9 @@
 
 syntax = "proto3";
 
-package vertex.v1.transport.grpc.v1;
+// Proto package includes the version; the directory path already lives under
+// /transport/grpc/v1/, so we don't duplicate the version here either.
+package vertex.transport.grpc.v1;
 
 option csharp_namespace = "Vertex.Transport.Grpc.Protocol.V1";
 option go_package = "github.com/dengxuan/vertex-go/transport/grpc/protocol/v1;protocolv1";
