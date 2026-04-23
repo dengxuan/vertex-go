@@ -18,6 +18,7 @@ type channelOptions struct {
 	invokeDefaultTimeout time.Duration
 	errorResponseTimeout time.Duration
 	subscriberInboxSize  int
+	closeDrainTimeout    time.Duration
 	logger               *slog.Logger
 }
 
@@ -29,7 +30,11 @@ func defaultChannelOptions() channelOptions {
 		// (the original MVP default of 32 was too tight under bursty load).
 		// Events still drop on overflow — see WithSubscriberInboxSize docs.
 		subscriberInboxSize: 256,
-		logger:              discardLogger(),
+		// Matches transport/grpc's drainTimeout. Long enough for a slow
+		// handler to flush its response, short enough that graceful
+		// shutdown doesn't hang a misbehaving deployment.
+		closeDrainTimeout: 5 * time.Second,
+		logger:            discardLogger(),
 	}
 }
 
@@ -59,6 +64,26 @@ func WithSubscriberInboxSize(n int) Option {
 	return func(o *channelOptions) {
 		if n > 0 {
 			o.subscriberInboxSize = n
+		}
+	}
+}
+
+// WithCloseDrainTimeout bounds how long Close waits for in-flight
+// dispatchRequest goroutines to finish flushing their responses before
+// cancelling the channel's lifetime context.
+//
+// Default: 5s. Set to 0 (or negative) to keep the default — passing an
+// explicit zero does not skip the drain. Increase only if handlers
+// legitimately need more time to complete (e.g. slow downstream DB writes
+// that still must flush on shutdown).
+//
+// When the drain times out, Vertex logs a Warn and proceeds; any handler
+// whose response hasn't reached the transport yet will see its ctx
+// cancelled and the remote caller will eventually hit its own timeout.
+func WithCloseDrainTimeout(d time.Duration) Option {
+	return func(o *channelOptions) {
+		if d > 0 {
+			o.closeDrainTimeout = d
 		}
 	}
 }

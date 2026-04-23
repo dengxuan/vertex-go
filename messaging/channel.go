@@ -78,6 +78,13 @@ type Channel struct {
 	lifetimeCtx    context.Context
 	lifetimeCancel context.CancelFunc
 
+	// inFlightRequests counts dispatchRequest goroutines that are still
+	// running. Close waits on this (bounded by closeDrainTimeout) before
+	// cancelling lifetimeCtx, so a handler that returned a response but
+	// hasn't yet flushed its transport.Send does not lose the response on
+	// graceful shutdown.
+	inFlightRequests sync.WaitGroup
+
 	nextSubID atomic.Uint64
 }
 
@@ -263,6 +270,15 @@ func (c *Channel) Invoke(
 
 // Close terminates the Channel. Pending invokes return an error. Underlying
 // transport is NOT closed here — callers own that lifetime.
+//
+// Graceful behavior: Close refuses to spawn new dispatchRequest goroutines
+// (c.closed gates the receiveLoop) and then waits up to closeDrainTimeout
+// for goroutines already in flight to finish. Only after the drain window
+// does it cancel lifetimeCtx. This prevents a common class of lost responses
+// on graceful shutdown: a handler returns its response, but the dispatcher's
+// transport.Send (which uses lifetimeCtx) gets its ctx cancelled before the
+// bytes hit the wire — the remote caller then sees PeerDisconnectedError
+// instead of the real response.
 func (c *Channel) Close() {
 	c.mu.Lock()
 	if c.closed {
@@ -280,6 +296,25 @@ func (c *Channel) Close() {
 		default:
 		}
 	}
+
+	// Drain in-flight dispatchRequest goroutines. Bounded: a pathological
+	// handler blocking past closeDrainTimeout doesn't block shutdown forever
+	// (we'll cancel lifetimeCtx anyway and let the remote time out).
+	drainDone := make(chan struct{})
+	go func() {
+		c.inFlightRequests.Wait()
+		close(drainDone)
+	}()
+	drainTimer := time.NewTimer(c.opts.closeDrainTimeout)
+	defer drainTimer.Stop()
+	select {
+	case <-drainDone:
+	case <-drainTimer.C:
+		c.opts.logger.Warn("vertex messaging: close drain timeout elapsed; in-flight handlers may have dropped responses",
+			"channel", c.name,
+			"timeout", c.opts.closeDrainTimeout)
+	}
+
 	// Cancelling lifetimeCtx wakes receiveLoop / connectionLoop / every
 	// in-flight dispatched handler that is honoring this ctx.
 	c.lifetimeCancel()
@@ -305,8 +340,20 @@ func (c *Channel) receiveLoop() {
 				c.dispatchEvent(env)
 			case KindRequest:
 				// Request handling runs in its own goroutine — invariant #1 forbids
-				// the receive loop from waiting on user code.
-				go c.dispatchRequest(env, msg.From)
+				// the receive loop from waiting on user code. Close drains these
+				// goroutines so a handler's response gets a chance to flush before
+				// lifetimeCtx is cancelled.
+				c.mu.Lock()
+				if c.closed {
+					c.mu.Unlock()
+					continue
+				}
+				c.inFlightRequests.Add(1)
+				c.mu.Unlock()
+				go func(env Envelope, from string) {
+					defer c.inFlightRequests.Done()
+					c.dispatchRequest(env, from)
+				}(env, msg.From)
 			}
 		case <-c.lifetimeCtx.Done():
 			return

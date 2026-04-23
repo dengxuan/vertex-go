@@ -175,6 +175,123 @@ func TestStats_TracksSubscriberInboxDrops(t *testing.T) {
 	t.Logf("dropped %d/%d events (expected at least 1)", got, N)
 }
 
+// TestClose_DrainsInFlightResponses verifies that Close waits for in-flight
+// dispatchRequest goroutines to finish flushing their responses before
+// cancelling lifetimeCtx. Regression guard for the bug where a handler's
+// transport.Send used the cancelled lifetimeCtx and dropped the response —
+// the remote caller would see PeerDisconnectedError instead of the real reply.
+func TestClose_DrainsInFlightResponses(t *testing.T) {
+	a, b := inMemTransportPair()
+	ca := NewChannel("alice", a)
+	defer ca.Close()
+	cb := NewChannel("bob", b)
+
+	// Slow handler — gives the test room to call Close() while a dispatch
+	// is mid-flight (handler still running, response not yet sent).
+	handlerRunning := make(chan struct{}, 1)
+	if err := HandleRequest[*wrapperspb.StringValue, *wrapperspb.StringValue](cb,
+		func(ctx context.Context, req *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
+			select {
+			case handlerRunning <- struct{}{}:
+			default:
+			}
+			time.Sleep(200 * time.Millisecond)
+			return &wrapperspb.StringValue{Value: "echo: " + req.Value}, nil
+		}); err != nil {
+		t.Fatalf("HandleRequest: %v", err)
+	}
+
+	invokeDone := make(chan error, 1)
+	invokeResp := make(chan string, 1)
+	go func() {
+		ctx := context.Background()
+		resp := &wrapperspb.StringValue{}
+		err := ca.Invoke(ctx, "", &wrapperspb.StringValue{Value: "hi"}, resp, 5*time.Second)
+		if err == nil {
+			invokeResp <- resp.Value
+		}
+		invokeDone <- err
+	}()
+
+	// Wait until the handler has started (so Close actually has an in-flight
+	// dispatch to drain).
+	select {
+	case <-handlerRunning:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	// Close mid-dispatch. Without the drain fix, the dispatcher's Send
+	// would observe a cancelled lifetimeCtx and drop the response.
+	closeStart := time.Now()
+	cb.Close()
+	closeElapsed := time.Since(closeStart)
+	// Close should have waited roughly the remainder of the handler's sleep.
+	if closeElapsed < 100*time.Millisecond {
+		t.Errorf("Close returned too fast (%s) — drain did not wait for in-flight dispatch", closeElapsed)
+	}
+
+	err := <-invokeDone
+	if err != nil {
+		t.Fatalf("expected Invoke to succeed after Close drain; got %v", err)
+	}
+	resp := <-invokeResp
+	if resp != "echo: hi" {
+		t.Errorf("want %q, got %q", "echo: hi", resp)
+	}
+}
+
+// TestClose_DrainTimeout verifies Close does not hang forever if a handler
+// blocks past the drain deadline. It should log a warn and return within
+// a bounded window so graceful-shutdown paths can make progress.
+func TestClose_DrainTimeout(t *testing.T) {
+	a, b := inMemTransportPair()
+	ca := NewChannel("alice", a)
+	defer ca.Close()
+	// Short drain so the test finishes quickly.
+	cb := NewChannel("bob", b, WithCloseDrainTimeout(100*time.Millisecond))
+
+	handlerRunning := make(chan struct{}, 1)
+	if err := HandleRequest[*wrapperspb.StringValue, *wrapperspb.StringValue](cb,
+		func(ctx context.Context, req *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
+			select {
+			case handlerRunning <- struct{}{}:
+			default:
+			}
+			// Block far longer than the drain — Close must give up eventually.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(10 * time.Second):
+				return &wrapperspb.StringValue{Value: "late"}, nil
+			}
+		}); err != nil {
+		t.Fatalf("HandleRequest: %v", err)
+	}
+
+	go func() {
+		ctx := context.Background()
+		resp := &wrapperspb.StringValue{}
+		_ = ca.Invoke(ctx, "", &wrapperspb.StringValue{Value: "x"}, resp, 2*time.Second)
+	}()
+
+	select {
+	case <-handlerRunning:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	closeStart := time.Now()
+	cb.Close()
+	closeElapsed := time.Since(closeStart)
+
+	// Should unblock shortly after the 100ms drain timeout — allow some slack
+	// but fail if it hung for seconds.
+	if closeElapsed > 2*time.Second {
+		t.Errorf("Close hung past drain timeout: elapsed=%s (drain=100ms)", closeElapsed)
+	}
+}
+
 func TestInvoke_NoHandler_ReturnsRemoteError(t *testing.T) {
 	a, b := inMemTransportPair()
 	ca := NewChannel("alice", a)
