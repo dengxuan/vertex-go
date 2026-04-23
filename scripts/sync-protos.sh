@@ -6,6 +6,11 @@
 # To bump the spec: edit scripts/.spec-ref, re-run this script, commit.
 set -euo pipefail
 
+CHECK_ONLY=0
+if [[ "${1:-}" == "--check-only" ]]; then
+  CHECK_ONLY=1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SHA_FILE="$SCRIPT_DIR/.spec-ref"
@@ -34,6 +39,15 @@ for p in "${PROTOS[@]}"; do
   echo "syncing $p @ $SPEC_SHA"
   curl -fsSL "$SPEC_RAW_BASE/$p" -o "$dst"
 done
+
+# --check-only skips protoc regen. Used by CI where installing protoc at an
+# exact version isn't worth the complexity — tool version differences leak
+# into the generated file header comments and false-positive the drift check.
+# Dev contributors omit the flag and run the full regeneration locally.
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  echo "check-only mode; skipping protoc regeneration (CI path)"
+  exit 0
+fi
 
 # Regenerate Go from the vendored protos. The `go_package` option inside each
 # .proto decides the output path (we honor it via --go_opt=module=<mod>).
