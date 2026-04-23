@@ -63,7 +63,12 @@ type Channel struct {
 	handlers    map[string]requestHandlerFn
 	closed      bool
 
-	done chan struct{}
+	// lifetimeCtx is cancelled by Close. Every dispatched event / request
+	// handler and every channel-initiated Send derives its ctx from here,
+	// so shutdown is cooperative without spawning a watcher goroutine per
+	// dispatch.
+	lifetimeCtx    context.Context
+	lifetimeCancel context.CancelFunc
 }
 
 // subscriberFn is the internal form of an event subscriber. The outer generic
@@ -89,13 +94,15 @@ type responseBytes struct {
 // consumes transport.Receive() and dispatches responses / events / requests.
 // Cancel by calling Close.
 func NewChannel(name string, t transport.Transport) *Channel {
+	ctx, cancel := context.WithCancel(context.Background())
 	ch := &Channel{
-		name:        name,
-		transport:   t,
-		pending:     make(map[string]*pendingRequest),
-		subscribers: make(map[string][]subscriberFn),
-		handlers:    make(map[string]requestHandlerFn),
-		done:        make(chan struct{}),
+		name:           name,
+		transport:      t,
+		pending:        make(map[string]*pendingRequest),
+		subscribers:    make(map[string][]subscriberFn),
+		handlers:       make(map[string]requestHandlerFn),
+		lifetimeCtx:    ctx,
+		lifetimeCancel: cancel,
 	}
 	go ch.receiveLoop()
 	go ch.connectionLoop()
@@ -184,7 +191,7 @@ func (c *Channel) Invoke(
 		return ctx.Err()
 	case <-timer.C:
 		return ErrTimeout
-	case <-c.done:
+	case <-c.lifetimeCtx.Done():
 		return errors.New("vertex messaging: channel closed")
 	}
 }
@@ -208,44 +215,64 @@ func (c *Channel) Close() {
 		default:
 		}
 	}
-	close(c.done)
+	// Cancelling lifetimeCtx wakes receiveLoop / connectionLoop / every
+	// in-flight dispatched handler that is honoring this ctx.
+	c.lifetimeCancel()
 }
 
 func (c *Channel) receiveLoop() {
-	for msg := range c.transport.Receive() {
-		env, err := Decode(msg.Frames)
-		if err != nil {
-			// Malformed — drop (invariant #1: the receive loop never dies on a bad message).
-			continue
-		}
-		switch env.Kind {
-		case KindResponse:
-			c.dispatchResponse(env)
-		case KindEvent:
-			c.dispatchEvent(env)
-		case KindRequest:
-			// Request handling runs in its own goroutine — invariant #1 forbids
-			// the receive loop from waiting on user code.
-			go c.dispatchRequest(env, msg.From)
+	recv := c.transport.Receive()
+	for {
+		select {
+		case msg, ok := <-recv:
+			if !ok {
+				return // transport closed
+			}
+			env, err := Decode(msg.Frames)
+			if err != nil {
+				// Malformed — drop (invariant #1: the receive loop never dies on a bad message).
+				continue
+			}
+			switch env.Kind {
+			case KindResponse:
+				c.dispatchResponse(env)
+			case KindEvent:
+				c.dispatchEvent(env)
+			case KindRequest:
+				// Request handling runs in its own goroutine — invariant #1 forbids
+				// the receive loop from waiting on user code.
+				go c.dispatchRequest(env, msg.From)
+			}
+		case <-c.lifetimeCtx.Done():
+			return
 		}
 	}
 }
 
 func (c *Channel) connectionLoop() {
-	for evt := range c.transport.Connections() {
-		if evt.State != transport.Disconnected {
-			continue
-		}
-		// Fail every in-flight invoke with a disconnected error.
-		c.mu.Lock()
-		pending := c.pending
-		c.pending = map[string]*pendingRequest{}
-		c.mu.Unlock()
-		for _, p := range pending {
-			select {
-			case p.resp <- responseBytes{err: &PeerDisconnectedError{Peer: evt.Peer}}:
-			default:
+	conns := c.transport.Connections()
+	for {
+		select {
+		case evt, ok := <-conns:
+			if !ok {
+				return // transport closed
 			}
+			if evt.State != transport.Disconnected {
+				continue
+			}
+			// Fail every in-flight invoke with a disconnected error.
+			c.mu.Lock()
+			pending := c.pending
+			c.pending = map[string]*pendingRequest{}
+			c.mu.Unlock()
+			for _, p := range pending {
+				select {
+				case p.resp <- responseBytes{err: &PeerDisconnectedError{Peer: evt.Peer}}:
+				default:
+				}
+			}
+		case <-c.lifetimeCtx.Done():
+			return
 		}
 	}
 }
@@ -282,7 +309,7 @@ func (c *Channel) dispatchEvent(env Envelope) {
 	for _, h := range subs {
 		go func(h subscriberFn) {
 			defer func() { _ = recover() }() // contain handler panics
-			_ = h(c.requestContext(), env.Payload)
+			_ = h(c.lifetimeCtx, env.Payload)
 		}(h)
 	}
 }
@@ -298,7 +325,7 @@ func (c *Channel) dispatchRequest(env Envelope, from string) {
 		return
 	}
 
-	ctx := c.requestContext()
+	ctx := c.lifetimeCtx
 	respBytes, err := c.invokeHandlerSafely(ctx, handler, env.Payload)
 	if err != nil {
 		c.sendErrorResponse(env.Topic, env.RequestID, from, err.Error())
@@ -341,21 +368,6 @@ func (c *Channel) sendErrorResponse(topic, requestID, target, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = c.transport.Send(ctx, target, resp.Encode())
-}
-
-// requestContext returns a context that is cancelled when the channel is
-// Close'd. Handlers and response-Send paths derive from this so shutdown is
-// cooperative.
-func (c *Channel) requestContext() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-c.done:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx
 }
 
 // registerSubscriber is the internal registration used by the generic Subscribe.

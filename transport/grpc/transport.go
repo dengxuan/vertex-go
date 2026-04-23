@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	grpcpkg "google.golang.org/grpc"
@@ -124,6 +125,13 @@ type Transport struct {
 	lifetimeCancel context.CancelFunc
 	doneLoop       chan struct{}
 
+	// shuttingDown flips to true inside Close() so runLoop stops reconnecting
+	// after the graceful CloseSend flush completes. Separate from lifetimeCtx
+	// because we want runLoop to finish processing the in-flight stream
+	// cleanly BEFORE we cancel (cancelling mid-stream would abort queued
+	// outbound frames).
+	shuttingDown atomic.Bool
+
 	closeOnce sync.Once
 }
 
@@ -227,14 +235,50 @@ func (t *Transport) Send(ctx context.Context, target string, frames [][]byte) er
 	return nil
 }
 
+// drainTimeout caps how long Close waits for in-flight frames to flush and
+// for the server to acknowledge the graceful half-close before force-cancelling.
+const drainTimeout = 5 * time.Second
+
 // Close shuts down the runLoop, the bidi stream, and the gRPC connection.
 // Idempotent. Safe to call from multiple goroutines.
+//
+// Shutdown is graceful: if a stream is open, Close first calls CloseSend so
+// any queued outbound frames (typically the tail of a just-finished Publish
+// / Invoke) reach the server before the stream is torn down. Otherwise a
+// client that published and immediately called Close would lose the envelope's
+// last few frames to an HTTP/2 RST_STREAM.
 func (t *Transport) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
+		// Signal runLoop: do NOT reconnect once the current stream ends.
+		t.shuttingDown.Store(true)
+
+		// Half-close the client → server direction of the current stream.
+		// All previously-queued SendMsg calls are ordered before the
+		// end-of-stream marker on the HTTP/2 wire, so this is safe to call
+		// right after the last Publish/Invoke return.
+		t.mu.Lock()
+		s := t.stream
+		t.mu.Unlock()
+		if s != nil {
+			_ = s.CloseSend()
+		}
+
+		// Wait up to drainTimeout for the server to finish processing and
+		// close its response side (which unblocks readLoop). If the server
+		// never closes (misbehaving / hung), fall back to force-cancel so
+		// Close doesn't hang forever.
+		select {
+		case <-t.doneLoop:
+			// runLoop exited naturally; lifetimeCtx may or may not be
+			// cancelled yet — always cancel below so the context graph stays
+			// tidy for downstream consumers.
+		case <-time.After(drainTimeout):
+			t.lifetimeCancel()
+			<-t.doneLoop
+		}
+
 		t.lifetimeCancel()
-		// Wait for runLoop to exit so we can close outputs exactly once.
-		<-t.doneLoop
 		err = t.conn.Close()
 	})
 	return err
@@ -251,7 +295,7 @@ func (t *Transport) runLoop() {
 
 	attempt := 0
 	for {
-		if t.lifetimeCtx.Err() != nil {
+		if t.lifetimeCtx.Err() != nil || t.shuttingDown.Load() {
 			return
 		}
 
@@ -278,7 +322,9 @@ func (t *Transport) runLoop() {
 		t.setStream(nil)
 		t.emitConnection(transport.Disconnected)
 
-		if !t.reconnect.Enabled {
+		// Graceful Close() sets shuttingDown after CloseSend — don't try to
+		// reconnect right after a voluntary shutdown.
+		if !t.reconnect.Enabled || t.shuttingDown.Load() {
 			return
 		}
 
