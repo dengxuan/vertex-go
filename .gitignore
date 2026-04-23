@@ -1,0 +1,32 @@
+# === Go binaries ===
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# === Go test ===
+*.test
+*.out
+
+# === Go workspace / vendor ===
+go.work
+go.work.sum
+vendor/
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# === Claude Code local settings ===
+.claude/settings.local.json
+
+# === Local/Tmp ===
+*.log
+*.tmp
+_tmp_*/
+tmp/
