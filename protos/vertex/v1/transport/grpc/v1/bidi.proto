@@ -1,0 +1,32 @@
+// Vertex gRPC transport wire protocol.
+//
+// Vertex's 4-frame envelope (see /spec/wire-format.md §2) is transported over
+// gRPC bidi streams by splitting each envelope into 4 consecutive TransportFrame
+// messages, with end_of_message = true on the 4th.
+//
+// Business payloads (the contents of TransportFrame.payload at the 4th frame
+// position) are serialized using Protobuf at this transport, not MessagePack
+// or anything else — gRPC's whole point is Protobuf tooling.
+
+syntax = "proto3";
+
+package vertex.v1.transport.grpc.v1;
+
+option csharp_namespace = "Vertex.Transport.Grpc.Protocol.V1";
+option go_package = "github.com/dengxuan/vertex-go/transport/grpc/protocol/v1;protocolv1";
+
+service Bidi {
+  // Single bidirectional stream. Client connects once and exchanges an
+  // unbounded interleaving of events / requests / responses.
+  rpc Connect(stream TransportFrame) returns (stream TransportFrame);
+}
+
+message TransportFrame {
+  // Opaque bytes of one envelope frame.
+  bytes payload = 1;
+
+  // true on the 4th (last) frame of each Vertex envelope.
+  // Receiver accumulates frames until end_of_message, then hands the
+  // 4-frame envelope to the messaging layer.
+  bool end_of_message = 2;
+}
