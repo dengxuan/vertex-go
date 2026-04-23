@@ -369,19 +369,34 @@ func (c *Channel) connectionLoop() {
 			if !ok {
 				return // transport closed
 			}
-			if evt.State != transport.Disconnected {
-				continue
-			}
-			// Fail every in-flight invoke with a disconnected error.
-			c.mu.Lock()
-			pending := c.pending
-			c.pending = map[string]*pendingRequest{}
-			c.mu.Unlock()
-			for _, p := range pending {
-				select {
-				case p.resp <- responseBytes{err: &PeerDisconnectedError{Peer: evt.Peer}}:
-				default:
+			if evt.State == transport.Disconnected {
+				// Fail every in-flight invoke with a disconnected error.
+				c.mu.Lock()
+				pending := c.pending
+				c.pending = map[string]*pendingRequest{}
+				c.mu.Unlock()
+				for _, p := range pending {
+					select {
+					case p.resp <- responseBytes{err: &PeerDisconnectedError{Peer: evt.Peer}}:
+					default:
+					}
 				}
+			}
+			// Forward to the user listener AFTER internal handling so listeners
+			// observe state transitions without racing the disconnect-path
+			// cleanup. Best-effort: a listener that panics gets swallowed so
+			// the connection loop stays alive.
+			if c.opts.onConnectionChange != nil {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							c.opts.logger.Warn("vertex messaging: connection listener panicked",
+								"channel", c.name,
+								"panic", fmt.Sprintf("%v", r))
+						}
+					}()
+					c.opts.onConnectionChange(evt)
+				}()
 			}
 		case <-c.lifetimeCtx.Done():
 			return

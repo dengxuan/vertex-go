@@ -7,10 +7,13 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/dengxuan/vertex-go/transport"
 )
 
 // Tests use well-known Protobuf wrapper types (wrapperspb.StringValue,
@@ -289,6 +292,50 @@ func TestClose_DrainTimeout(t *testing.T) {
 	// but fail if it hung for seconds.
 	if closeElapsed > 2*time.Second {
 		t.Errorf("Close hung past drain timeout: elapsed=%s (drain=100ms)", closeElapsed)
+	}
+}
+
+// TestWithConnectionChangeListener_ReceivesEvents asserts the listener fires
+// on every transport ConnectionEvent, in order, without racing the channel's
+// own disconnect-handling.
+func TestWithConnectionChangeListener_ReceivesEvents(t *testing.T) {
+	a, _ := inMemTransportPair()
+
+	var mu sync.Mutex
+	var events []transport.ConnectionEvent
+	ch := NewChannel("alice", a,
+		WithConnectionChangeListener(func(e transport.ConnectionEvent) {
+			mu.Lock()
+			events = append(events, e)
+			mu.Unlock()
+		}))
+	defer ch.Close()
+
+	// Drive a couple of events onto the transport's Connections channel.
+	a.conns <- transport.ConnectionEvent{Peer: "peer1", State: transport.Connected}
+	a.conns <- transport.ConnectionEvent{Peer: "peer1", State: transport.Disconnected}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(events)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d: %+v", len(events), events)
+	}
+	if events[0].State != transport.Connected {
+		t.Errorf("event 0: want Connected, got %v", events[0].State)
+	}
+	if events[1].State != transport.Disconnected {
+		t.Errorf("event 1: want Disconnected, got %v", events[1].State)
 	}
 }
 

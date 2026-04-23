@@ -7,6 +7,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/dengxuan/vertex-go/transport"
 )
 
 // Option configures a Channel at construction time. Variadic functional-options
@@ -20,6 +22,7 @@ type channelOptions struct {
 	subscriberInboxSize  int
 	closeDrainTimeout    time.Duration
 	logger               *slog.Logger
+	onConnectionChange   func(transport.ConnectionEvent)
 }
 
 func defaultChannelOptions() channelOptions {
@@ -84,6 +87,24 @@ func WithCloseDrainTimeout(d time.Duration) Option {
 	return func(o *channelOptions) {
 		if d > 0 {
 			o.closeDrainTimeout = d
+		}
+	}
+}
+
+// WithConnectionChangeListener registers a callback that fires every time
+// the underlying transport emits a ConnectionEvent (Connected / Disconnected).
+//
+// The callback runs on the channel's connection loop goroutine and MUST NOT
+// block — do work asynchronously if needed. It runs AFTER the channel's own
+// pending-invoke failure handling on Disconnected, so the listener observes
+// state transitions without racing the internal disconnect path.
+//
+// Typical use: downstream SDKs that expose their own state-change hook
+// (e.g. "Connected → OnStateChange(Connected)") to application code.
+func WithConnectionChangeListener(fn func(transport.ConnectionEvent)) Option {
+	return func(o *channelOptions) {
+		if fn != nil {
+			o.onConnectionChange = fn
 		}
 	}
 }
