@@ -51,7 +51,7 @@ jobs:
       - name: Verify vendored protos + generated Go match pinned spec SHA
         if: steps.haveCode.outputs.present == 'true'
         run: |
-          ./scripts/sync-protos.sh
+          bash scripts/sync-protos.sh
           if ! git diff --quiet --exit-code -- protos transport/grpc/protocol; then
             echo "::error::Vendored protos or generated Go drifted from pinned spec SHA."
             echo "Run scripts/sync-protos.sh locally and commit the result, or update scripts/.spec-ref if a spec bump is intended."
