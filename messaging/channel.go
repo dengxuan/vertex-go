@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -57,9 +58,11 @@ type Channel struct {
 	name      string
 	transport transport.Transport
 
+	opts channelOptions
+
 	mu          sync.Mutex // guards pending + subscribers + handlers + closed
 	pending     map[string]*pendingRequest
-	subscribers map[string][]subscriberFn
+	subscribers map[string][]*subscription
 	handlers    map[string]requestHandlerFn
 	closed      bool
 
@@ -69,6 +72,21 @@ type Channel struct {
 	// dispatch.
 	lifetimeCtx    context.Context
 	lifetimeCancel context.CancelFunc
+
+	nextSubID atomic.Uint64
+}
+
+// subscription is one Subscribe-registered handler. Each subscription owns
+// a private buffered inbox and a dedicated worker goroutine. Events fan out
+// to all subscriptions for a topic; one slow subscriber only backpressures
+// (and eventually drops into) its own inbox — other subscribers keep flowing
+// and the receive loop never blocks.
+type subscription struct {
+	id    uint64
+	fn    subscriberFn
+	inbox chan []byte
+	// cancelled is closed by the unsubscribe func to tell the worker to exit.
+	cancelled chan struct{}
 }
 
 // subscriberFn is the internal form of an event subscriber. The outer generic
@@ -93,13 +111,18 @@ type responseBytes struct {
 // NewChannel wires a Channel to a transport. It spawns a goroutine that
 // consumes transport.Receive() and dispatches responses / events / requests.
 // Cancel by calling Close.
-func NewChannel(name string, t transport.Transport) *Channel {
+func NewChannel(name string, t transport.Transport, opts ...Option) *Channel {
+	co := defaultChannelOptions()
+	for _, o := range opts {
+		o(&co)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := &Channel{
 		name:           name,
 		transport:      t,
+		opts:           co,
 		pending:        make(map[string]*pendingRequest),
-		subscribers:    make(map[string][]subscriberFn),
+		subscribers:    make(map[string][]*subscription),
 		handlers:       make(map[string]requestHandlerFn),
 		lifetimeCtx:    ctx,
 		lifetimeCancel: cancel,
@@ -139,7 +162,7 @@ func (c *Channel) Invoke(
 	timeout time.Duration,
 ) error {
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = c.opts.invokeDefaultTimeout
 	}
 
 	payload, err := proto.Marshal(request)
@@ -296,7 +319,7 @@ func (c *Channel) dispatchResponse(env Envelope) {
 
 func (c *Channel) dispatchEvent(env Envelope) {
 	c.mu.Lock()
-	subs := append([]subscriberFn(nil), c.subscribers[env.Topic]...)
+	subs := append([]*subscription(nil), c.subscribers[env.Topic]...)
 	c.mu.Unlock()
 
 	if len(subs) == 0 {
@@ -304,13 +327,17 @@ func (c *Channel) dispatchEvent(env Envelope) {
 		return
 	}
 
-	// Each subscriber runs in its own goroutine; one slow handler must not
-	// head-of-line-block others sharing the event stream (invariant #1).
-	for _, h := range subs {
-		go func(h subscriberFn) {
-			defer func() { _ = recover() }() // contain handler panics
-			_ = h(c.lifetimeCtx, env.Payload)
-		}(h)
+	// Fan out by pushing into each subscriber's private inbox. Drop-on-full
+	// is the backpressure policy — one slow subscriber cannot stall other
+	// subscribers or the receive loop (invariant #1). Handler invocation
+	// happens on the per-subscriber worker goroutine.
+	for _, sub := range subs {
+		select {
+		case sub.inbox <- env.Payload:
+		default:
+			// Dropped: this subscriber's inbox is full. The app may tune
+			// WithSubscriberInboxSize if this happens persistently.
+		}
 	}
 }
 
@@ -364,29 +391,66 @@ func (c *Channel) sendErrorResponse(topic, requestID, target, message string) {
 		RequestID: requestID,
 		Payload:   []byte(message),
 	}
-	// Best-effort — use background ctx so ongoing per-call ctxs don't kill this.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Best-effort — use background ctx so ongoing per-call ctxs don't kill
+	// this. Timeout is WithErrorResponseTimeout (default 5s).
+	ctx, cancel := context.WithTimeout(context.Background(), c.opts.errorResponseTimeout)
 	defer cancel()
 	_ = c.transport.Send(ctx, target, resp.Encode())
 }
 
 // registerSubscriber is the internal registration used by the generic Subscribe.
+// Each call spins up a dedicated worker goroutine; the worker exits when the
+// subscription is cancelled OR the channel's lifetimeCtx is cancelled.
 func (c *Channel) registerSubscriber(topic string, fn subscriberFn) func() {
+	sub := &subscription{
+		id:        c.nextSubID.Add(1),
+		fn:        fn,
+		inbox:     make(chan []byte, c.opts.subscriberInboxSize),
+		cancelled: make(chan struct{}),
+	}
+
+	go c.runSubscriberWorker(sub)
+
 	c.mu.Lock()
-	c.subscribers[topic] = append(c.subscribers[topic], fn)
+	c.subscribers[topic] = append(c.subscribers[topic], sub)
 	c.mu.Unlock()
+
+	var once sync.Once
 	return func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		list := c.subscribers[topic]
-		for i := range list {
-			// Compare by function identity (same closure reference).
-			if &list[i] == &fn {
-				c.subscribers[topic] = append(list[:i], list[i+1:]...)
+		once.Do(func() {
+			c.mu.Lock()
+			list := c.subscribers[topic]
+			for i, s := range list {
+				if s.id == sub.id {
+					c.subscribers[topic] = append(list[:i], list[i+1:]...)
+					break
+				}
+			}
+			c.mu.Unlock()
+			close(sub.cancelled)
+		})
+	}
+}
+
+func (c *Channel) runSubscriberWorker(sub *subscription) {
+	for {
+		select {
+		case payload, ok := <-sub.inbox:
+			if !ok {
 				return
 			}
+			c.invokeSubscriberSafely(sub.fn, payload)
+		case <-sub.cancelled:
+			return
+		case <-c.lifetimeCtx.Done():
+			return
 		}
 	}
+}
+
+func (c *Channel) invokeSubscriberSafely(fn subscriberFn, payload []byte) {
+	defer func() { _ = recover() }() // contain handler panics (invariant #1 corollary)
+	_ = fn(c.lifetimeCtx, payload)
 }
 
 // registerHandler is the internal registration used by the generic HandleRequest.

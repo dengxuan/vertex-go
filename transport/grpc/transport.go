@@ -427,9 +427,15 @@ func (t *Transport) waitForStream(ctx context.Context) (grpcpkg.BidiStreamingCli
 }
 
 func (t *Transport) emitConnection(state transport.ConnectionState) {
+	// Non-blocking: state transitions are idempotent (the latest
+	// Connected/Disconnected is the ground truth; missing a transient
+	// middle transition does not break correctness). A full buffer means
+	// the consumer is not keeping up — we would rather drop an event than
+	// block runLoop's reconnect cycle waiting for it.
+	ev := transport.ConnectionEvent{Peer: t.serverAddr, State: state}
 	select {
-	case t.connections <- transport.ConnectionEvent{Peer: t.serverAddr, State: state}:
-	case <-t.lifetimeCtx.Done():
+	case t.connections <- ev:
+	default:
 	}
 }
 
