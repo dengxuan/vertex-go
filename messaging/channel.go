@@ -60,11 +60,12 @@ type Channel struct {
 
 	opts channelOptions
 
-	mu          sync.Mutex // guards pending + subscribers + handlers + closed
-	pending     map[string]*pendingRequest
-	subscribers map[string][]*subscription
-	handlers    map[string]requestHandlerFn
-	closed      bool
+	mu           sync.Mutex // guards pending + subscribers + wildcardSubs + handlers + closed
+	pending      map[string]*pendingRequest
+	subscribers  map[string][]*subscription
+	wildcardSubs []*wildcardSubscription
+	handlers     map[string]requestHandlerFn
+	closed       bool
 
 	// statsMu guards the stats maps. Separate from mu so Stats() callers
 	// don't contend with the hot dispatch path.
@@ -125,6 +126,36 @@ type ChannelStats struct {
 // [Subscribe] helper wraps a typed handler into this uniform signature so the
 // receiveLoop dispatcher doesn't have to know the concrete type.
 type subscriberFn func(ctx context.Context, payload []byte) error
+
+// wildcardSubscription is a "subscribe to all topics" registration created by
+// [SubscribeAll]. Unlike topic-typed [subscription] (one inbox per topic per
+// sub), a wildcard sub gets every event delivered to the channel regardless
+// of topic — and crucially, in **wire receive order across topics**, because
+// the receiveLoop is single-goroutine and fan-out into the wildcard sub's
+// inbox preserves enqueue order.
+//
+// Use case: consumer needs cross-topic ordering for the same logical entity
+// (e.g. lottery issue lifecycle: opening → stopping → drawing → finished →
+// next opening). With per-type [Subscribe], each type has its own inbox +
+// worker → fan-out racing → cross-type order lost. SubscribeAll funnels
+// everything through one inbox + one worker → wire order preserved.
+type wildcardSubscription struct {
+	id    uint64
+	fn    wildcardSubscriberFn
+	inbox chan Envelope
+	// dropped is a monotonic counter of events rejected because inbox was full.
+	// Aggregated under the "*" key in [ChannelStats.EventsDropped].
+	dropped   atomic.Uint64
+	cancelled chan struct{}
+}
+
+// wildcardSubscriberFn is the internal form of a wildcard subscriber.
+type wildcardSubscriberFn func(ctx context.Context, env Envelope) error
+
+// WildcardTopic is the [ChannelStats.EventsDropped] map key under which
+// wildcard subscriber drops are aggregated (drops aren't per-topic since
+// wildcard subs receive all topics).
+const WildcardTopic = "*"
 
 // requestHandlerFn is the internal form of an RPC handler. Returns either a
 // marshalled response or an error (which gets turned into an error envelope).
@@ -424,17 +455,17 @@ func (c *Channel) dispatchResponse(env Envelope) {
 func (c *Channel) dispatchEvent(env Envelope) {
 	c.mu.Lock()
 	subs := append([]*subscription(nil), c.subscribers[env.Topic]...)
+	wildSubs := append([]*wildcardSubscription(nil), c.wildcardSubs...)
 	c.mu.Unlock()
 
-	if len(subs) == 0 {
-		// No subscribers → silently drop. Matches .NET semantics.
+	if len(subs) == 0 && len(wildSubs) == 0 {
+		// No subscribers (typed or wildcard) → silently drop. Matches .NET semantics.
 		return
 	}
 
-	// Fan out by pushing into each subscriber's private inbox. Drop-on-full
-	// is the backpressure policy — one slow subscriber cannot stall other
-	// subscribers or the receive loop (invariant #1). Handler invocation
-	// happens on the per-subscriber worker goroutine.
+	// Fan out to topic-typed subscribers (existing behavior). Each gets the
+	// raw payload bytes. Drop-on-full backpressure — one slow subscriber
+	// cannot stall others or the receive loop (invariant #1).
 	for _, sub := range subs {
 		select {
 		case sub.inbox <- env.Payload:
@@ -452,6 +483,27 @@ func (c *Channel) dispatchEvent(env Envelope) {
 				"subscription_id", sub.id,
 				"inbox_cap", cap(sub.inbox),
 				"subscription_dropped_total", sub.dropped.Load())
+		}
+	}
+
+	// Fan out to wildcard subscribers (SubscribeAll). They get the full
+	// envelope including Topic — the consumer's responsibility to demux.
+	// Same drop-on-full policy as typed subs; drops aggregated under
+	// [WildcardTopic] key in stats.
+	for _, ws := range wildSubs {
+		select {
+		case ws.inbox <- env:
+		default:
+			ws.dropped.Add(1)
+			c.statsMu.Lock()
+			c.eventsDropped[WildcardTopic]++
+			c.statsMu.Unlock()
+			c.opts.logger.Warn("vertex messaging: event dropped (wildcard subscriber inbox full)",
+				"channel", c.name,
+				"topic", env.Topic,
+				"subscription_id", ws.id,
+				"inbox_cap", cap(ws.inbox),
+				"subscription_dropped_total", ws.dropped.Load())
 		}
 	}
 }
@@ -557,6 +609,64 @@ func (c *Channel) registerSubscriber(topic string, fn subscriberFn) func() {
 			close(sub.cancelled)
 		})
 	}
+}
+
+// registerWildcardSubscriber is the internal registration used by [SubscribeAll].
+// Each call spins up a dedicated worker goroutine + private inbox, like
+// [registerSubscriber], but receives every event regardless of topic — and
+// hence preserves cross-topic order = wire receive order.
+func (c *Channel) registerWildcardSubscriber(fn wildcardSubscriberFn) func() {
+	ws := &wildcardSubscription{
+		id:        c.nextSubID.Add(1),
+		fn:        fn,
+		inbox:     make(chan Envelope, c.opts.subscriberInboxSize),
+		cancelled: make(chan struct{}),
+	}
+
+	go c.runWildcardWorker(ws)
+
+	c.mu.Lock()
+	c.wildcardSubs = append(c.wildcardSubs, ws)
+	c.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.mu.Lock()
+			for i, s := range c.wildcardSubs {
+				if s.id == ws.id {
+					c.wildcardSubs = append(c.wildcardSubs[:i], c.wildcardSubs[i+1:]...)
+					break
+				}
+			}
+			c.mu.Unlock()
+			close(ws.cancelled)
+		})
+	}
+}
+
+func (c *Channel) runWildcardWorker(ws *wildcardSubscription) {
+	for {
+		select {
+		case env, ok := <-ws.inbox:
+			if !ok {
+				return
+			}
+			c.invokeWildcardSafely(ws.fn, env)
+		case <-ws.cancelled:
+			return
+		case <-c.lifetimeCtx.Done():
+			return
+		}
+	}
+}
+
+// invokeWildcardSafely is the wildcard counterpart of invokeSubscriberSafely:
+// contain handler panics (invariant #1 corollary) and silently swallow user
+// handler errors — symmetric with the typed-subscriber path.
+func (c *Channel) invokeWildcardSafely(fn wildcardSubscriberFn, env Envelope) {
+	defer func() { _ = recover() }()
+	_ = fn(c.lifetimeCtx, env)
 }
 
 func (c *Channel) runSubscriberWorker(sub *subscription) {
