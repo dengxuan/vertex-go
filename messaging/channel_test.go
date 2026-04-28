@@ -339,6 +339,186 @@ func TestWithConnectionChangeListener_ReceivesEvents(t *testing.T) {
 	}
 }
 
+// TestSubscribeAll_ReceivesAllTopics 验证 wildcard subscriber 拿到所有 topic
+// 的 envelope（不需要预注册 type / topic）。
+func TestSubscribeAll_ReceivesAllTopics(t *testing.T) {
+	a, b := inMemTransportPair()
+	ca := NewChannel("alice", a)
+	defer ca.Close()
+	cb := NewChannel("bob", b)
+	defer cb.Close()
+
+	received := make(chan Envelope, 4)
+	cancel := SubscribeAll(cb, func(ctx context.Context, env Envelope) error {
+		received <- env
+		return nil
+	})
+	defer cancel()
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelCtx()
+
+	if err := ca.Publish(ctx, "", &wrapperspb.StringValue{Value: "s1"}); err != nil {
+		t.Fatalf("Publish StringValue: %v", err)
+	}
+	if err := ca.Publish(ctx, "", &wrapperspb.Int32Value{Value: 42}); err != nil {
+		t.Fatalf("Publish Int32Value: %v", err)
+	}
+
+	got := make([]string, 0, 2)
+	deadline := time.After(2 * time.Second)
+	for len(got) < 2 {
+		select {
+		case env := <-received:
+			got = append(got, env.Topic)
+		case <-deadline:
+			t.Fatalf("timeout: only got %d envelopes (%v)", len(got), got)
+		}
+	}
+	wantTopics := map[string]bool{
+		"google.protobuf.StringValue": true,
+		"google.protobuf.Int32Value":  true,
+	}
+	for _, topic := range got {
+		if !wantTopics[topic] {
+			t.Errorf("unexpected topic %q (got: %v)", topic, got)
+		}
+	}
+}
+
+// TestSubscribeAll_PreservesCrossTopicOrder 这是 SubscribeAll 存在的根本原因 ——
+// 跨 topic 顺序保留。Subscribe[T] 把不同 type 路由到独立 inbox+worker，跨 type
+// race；SubscribeAll 单 inbox+worker，wire 顺序 = handler 调用顺序。
+//
+// 测试方法：交替发 100 条 String/Int 事件，校验 wildcard handler 收到的顺序
+// 完全等同 publish 顺序。
+func TestSubscribeAll_PreservesCrossTopicOrder(t *testing.T) {
+	const N = 100
+	a, b := inMemTransportPair()
+	ca := NewChannel("alice", a)
+	defer ca.Close()
+	cb := NewChannel("bob", b)
+	defer cb.Close()
+
+	received := make(chan string, N) // "s:0" / "i:1" / "s:2" / ...
+	cancel := SubscribeAll(cb, func(ctx context.Context, env Envelope) error {
+		// Encode topic-shorthand + payload as a single string for ordering check.
+		// Don't unmarshal — we only care about sequence here.
+		shorthand := "?"
+		if strings.HasSuffix(env.Topic, ".StringValue") {
+			shorthand = "s"
+		} else if strings.HasSuffix(env.Topic, ".Int32Value") {
+			shorthand = "i"
+		}
+		received <- shorthand
+		return nil
+	})
+	defer cancel()
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelCtx()
+
+	want := make([]string, 0, N)
+	for i := 0; i < N; i++ {
+		if i%2 == 0 {
+			if err := ca.Publish(ctx, "", &wrapperspb.StringValue{Value: ""}); err != nil {
+				t.Fatalf("Publish String %d: %v", i, err)
+			}
+			want = append(want, "s")
+		} else {
+			if err := ca.Publish(ctx, "", &wrapperspb.Int32Value{Value: int32(i)}); err != nil {
+				t.Fatalf("Publish Int %d: %v", i, err)
+			}
+			want = append(want, "i")
+		}
+	}
+
+	got := make([]string, 0, N)
+	deadline := time.After(5 * time.Second)
+	for len(got) < N {
+		select {
+		case s := <-received:
+			got = append(got, s)
+		case <-deadline:
+			t.Fatalf("timeout: only got %d/%d (%v)", len(got), N, got)
+		}
+	}
+
+	// 最关键的断言：order 完全等于 publish 顺序。
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order broken at index %d: want %q, got %q (full got: %v)", i, want[i], got[i], got)
+		}
+	}
+}
+
+// TestSubscribeAll_CoexistsWithTypedSubscribe 验证 wildcard 和 typed sub 同时存在
+// 互不影响 —— wildcard 拿全集，typed 拿自己 topic 的。
+func TestSubscribeAll_CoexistsWithTypedSubscribe(t *testing.T) {
+	a, b := inMemTransportPair()
+	ca := NewChannel("alice", a)
+	defer ca.Close()
+	cb := NewChannel("bob", b)
+	defer cb.Close()
+
+	wildSeen := make(chan string, 2)
+	cancelWild := SubscribeAll(cb, func(ctx context.Context, env Envelope) error {
+		wildSeen <- env.Topic
+		return nil
+	})
+	defer cancelWild()
+
+	typedSeen := make(chan string, 1)
+	cancelTyped, err := Subscribe[*wrapperspb.StringValue](cb, func(ctx context.Context, v *wrapperspb.StringValue) error {
+		typedSeen <- v.Value
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer cancelTyped()
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelCtx()
+
+	if err := ca.Publish(ctx, "", &wrapperspb.StringValue{Value: "hello"}); err != nil {
+		t.Fatalf("Publish String: %v", err)
+	}
+	if err := ca.Publish(ctx, "", &wrapperspb.Int32Value{Value: 7}); err != nil {
+		t.Fatalf("Publish Int: %v", err)
+	}
+
+	// wildcard 应该收到 2 条
+	gotWild := []string{}
+	deadline := time.After(2 * time.Second)
+	for len(gotWild) < 2 {
+		select {
+		case t := <-wildSeen:
+			gotWild = append(gotWild, t)
+		case <-deadline:
+			t.Fatalf("wildcard: only got %d/2 (%v)", len(gotWild), gotWild)
+		}
+	}
+
+	// typed 只应该收到 String 那一条
+	select {
+	case v := <-typedSeen:
+		if v != "hello" {
+			t.Errorf("typed: want \"hello\", got %q", v)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("typed: did not receive StringValue within 500ms")
+	}
+
+	// typed 不应该再收到 Int32 那条
+	select {
+	case v := <-typedSeen:
+		t.Errorf("typed: leaked Int32 as %q", v)
+	case <-time.After(200 * time.Millisecond):
+		// good
+	}
+}
+
 func TestInvoke_NoHandler_ReturnsRemoteError(t *testing.T) {
 	a, b := inMemTransportPair()
 	ca := NewChannel("alice", a)

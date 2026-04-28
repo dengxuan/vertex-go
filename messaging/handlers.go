@@ -40,6 +40,36 @@ func Subscribe[T proto.Message](
 	return c.registerSubscriber(topic, wrapper), nil
 }
 
+// SubscribeAll registers a wildcard event handler that receives every event
+// envelope published to the channel, regardless of topic — and crucially, in
+// **wire receive order across topics**.
+//
+// Why this exists: the typed [Subscribe] creates one inbox + one worker per
+// type T. If a consumer registers Subscribe for both T1 and T2, events of
+// type T1 and T2 arrive in two independent goroutines with no cross-type
+// ordering guarantee (each subscription's worker drains its own inbox
+// independently). For consumers that need cross-type ordering on the same
+// logical entity (e.g. a state machine where the producer publishes events
+// of multiple types in a strict order), Subscribe[T] is unsuitable.
+//
+// SubscribeAll funnels every envelope through one inbox + one worker. Since
+// the channel's receiveLoop is a single goroutine, enqueue order = wire
+// receive order, so the handler observes events in exactly the order the
+// transport delivered them.
+//
+// Trade-off vs Subscribe[T]: the consumer is responsible for demuxing by
+// [Envelope.Topic] and unmarshalling the payload to the appropriate proto
+// type. Vertex stays out of typed dispatch — that's a consumer-layer concern.
+//
+// Drop-on-full backpressure is identical to typed subs: a slow handler
+// cannot stall the receive loop or other subscribers; drops are aggregated
+// under the [WildcardTopic] key in [ChannelStats.EventsDropped].
+//
+// Returns a cancel function; calling it removes this wildcard subscription.
+func SubscribeAll(c *Channel, handler func(ctx context.Context, env Envelope) error) func() {
+	return c.registerWildcardSubscriber(handler)
+}
+
 // HandleRequest registers the single RPC handler for type Req → Resp on the
 // channel. Only one handler per Req type; re-registering replaces the previous
 // handler.
